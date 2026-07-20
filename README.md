@@ -11,11 +11,20 @@ ChatGPT Plus subscription instead of a separate paid API key.
 node bin/cli.js --port 8080
 ```
 
+This prints a random API key on startup (or set your own via `--api-key` /
+`PROXY_API_KEY`) — you'll need it for every request except `/health`:
+
+```
+codex-openai-proxy listening on http://127.0.0.1:8080
+API key (send as "Authorization: Bearer <key>"): 3c1b8f2e-...
+```
+
 Then point any OpenAI-compatible client at `http://localhost:8080`:
 
 ```bash
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <key from startup log>" \
   -d '{
     "model": "gpt-5.6-sol",
     "messages": [{"role": "user", "content": "Hello!"}]
@@ -31,7 +40,20 @@ ran the Codex CLI).
 | Flag / env var | Default | Description |
 | --- | --- | --- |
 | `--port` / `PORT` | `8080` | Port to listen on |
+| `--host` / `HOST` | `127.0.0.1` | Interface to bind to — keep this on loopback unless you know you want it reachable from elsewhere |
 | `--auth-path` / `CODEX_AUTH_PATH` | `~/.codex/auth.json` | Path to Codex CLI's auth file |
+| `--api-key` / `PROXY_API_KEY` | randomly generated at startup | Bearer token clients must send; required because this proxy rides your live ChatGPT session with no other access control |
+
+## Security notes
+
+- The server binds to `127.0.0.1` by default. There's no CORS restriction, so
+  binding it to a wider interface (or exposing it via a tunnel) means
+  **anything that can reach the port — including a malicious webpage your
+  browser visits, if bound beyond loopback — can spend your ChatGPT Plus
+  quota** unless it also has the API key.
+- All endpoints except `/health` require `Authorization: Bearer <api-key>`.
+- Error responses never include raw upstream/internal error text; full detail
+  is logged server-side (stdout/stderr) instead.
 
 ## Endpoints
 

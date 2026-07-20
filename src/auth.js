@@ -38,7 +38,8 @@ async function refreshTokens(authPath, auth) {
   });
 
   if (!res.ok) {
-    throw new Error(`Codex token refresh failed: ${res.status} ${await res.text()}`);
+    console.error(`Codex token refresh failed: ${res.status} ${await res.text().catch(() => "")}`);
+    throw new Error("Codex token refresh failed");
   }
 
   const data = await res.json();

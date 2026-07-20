@@ -1,5 +1,5 @@
 import { createServer as createHttpServer } from "node:http";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { getAccessToken, resolveAuthPath } from "./auth.js";
 import {
   chatCompletionsToResponsesRequest,
@@ -18,6 +18,24 @@ function sendJson(res, status, body) {
 
 function jsonError(res, status, message) {
   sendJson(res, status, { error: { message, type: "proxy_error" } });
+}
+
+// Logs full detail server-side but only ever sends a generic, client-safe
+// message over the wire — the raw text may include upstream account/session
+// details or internal exception messages that shouldn't leak to callers.
+function jsonErrorSafe(res, status, publicMessage, detail) {
+  if (detail !== undefined) console.error(publicMessage, detail);
+  jsonError(res, status, publicMessage);
+}
+
+function isAuthorized(req, apiKey) {
+  if (!apiKey) return true;
+  const header = req.headers["authorization"] || "";
+  const provided = header.startsWith("Bearer ") ? header.slice(7) : "";
+  const providedBuf = Buffer.from(provided);
+  const expectedBuf = Buffer.from(apiKey);
+  if (providedBuf.length !== expectedBuf.length) return false;
+  return timingSafeEqual(providedBuf, expectedBuf);
 }
 
 async function readJsonBody(req) {
@@ -69,7 +87,7 @@ async function handleChatCompletions(req, res, ctx) {
 
   if (!backendRes.ok) {
     const text = await backendRes.text().catch(() => "");
-    return jsonError(res, backendRes.status, `Codex backend error: ${text.slice(0, 500)}`);
+    return jsonErrorSafe(res, backendRes.status, "Codex backend request failed", text.slice(0, 2000));
   }
 
   if (wantsStream) {
@@ -107,7 +125,7 @@ async function handleChatCompletions(req, res, ctx) {
   }
 }
 
-export function createServer({ authPath: explicitAuthPath } = {}) {
+export function createServer({ authPath: explicitAuthPath, apiKey } = {}) {
   const authPath = resolveAuthPath(explicitAuthPath);
   const ctx = { authPath };
 
@@ -116,6 +134,11 @@ export function createServer({ authPath: explicitAuthPath } = {}) {
       if (req.method === "GET" && req.url === "/health") {
         return sendJson(res, 200, { status: "ok" });
       }
+
+      if (!isAuthorized(req, apiKey)) {
+        return jsonError(res, 401, "Missing or invalid API key");
+      }
+
       if (req.method === "GET" && req.url === "/v1/models") {
         const models = await listModels(ctx.authPath);
         return sendJson(res, 200, { object: "list", data: models });
@@ -125,7 +148,7 @@ export function createServer({ authPath: explicitAuthPath } = {}) {
       }
       jsonError(res, 404, "Not found");
     } catch (err) {
-      jsonError(res, 500, err.message ?? "Internal error");
+      jsonErrorSafe(res, 500, "Internal server error", err);
     }
   });
 }
