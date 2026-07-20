@@ -1,0 +1,16 @@
+{
+  "name": "codex-openai-proxy",
+  "version": "0.1.0",
+  "description": "OpenAI-compatible proxy backed by a Codex CLI ChatGPT Plus session",
+  "type": "module",
+  "bin": {
+    "codex-openai-proxy": "./bin/cli.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node bin/cli.js",
+    "test": "node --test test/*.test.js"
+  }
+}
