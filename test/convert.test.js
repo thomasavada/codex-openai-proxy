@@ -2,9 +2,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   chatCompletionsToResponsesRequest,
+  imageGenerationsToResponsesRequest,
   parseSSEEvents,
   responsesEventToChatChunk,
+  collectImageFromEvent,
   buildChatCompletionResponse,
+  buildImageGenerationResponse,
 } from "../src/convert.js";
 
 test("chatCompletionsToResponsesRequest maps messages to input items", () => {
@@ -76,4 +79,47 @@ test("buildChatCompletionResponse shapes a non-streaming response", () => {
   const res = buildChatCompletionResponse({ id: "id1", model: "m", created: 1, content: "hi" });
   assert.equal(res.object, "chat.completion");
   assert.equal(res.choices[0].message.content, "hi");
+});
+
+test("imageGenerationsToResponsesRequest forces the image_generation tool", () => {
+  const req = imageGenerationsToResponsesRequest({ prompt: "a red apple", size: "1024x1024" });
+  assert.equal(req.model, "gpt-5.4");
+  assert.equal(req.tool_choice.type, "image_generation");
+  assert.equal(req.tools[0].type, "image_generation");
+  assert.equal(req.tools[0].size, "1024x1024");
+  assert.equal(req.tools[0].quality, "medium");
+  assert.match(req.input[0].content[0].text, /a red apple/);
+});
+
+test("imageGenerationsToResponsesRequest remaps dall-e / gpt-image models", () => {
+  const req = imageGenerationsToResponsesRequest({ model: "dall-e-3", prompt: "cat" });
+  assert.equal(req.model, "gpt-5.4");
+});
+
+test("imageGenerationsToResponsesRequest keeps a mainline chat model", () => {
+  const req = imageGenerationsToResponsesRequest({ model: "gpt-5.5", prompt: "cat" });
+  assert.equal(req.model, "gpt-5.5");
+});
+
+test("collectImageFromEvent prefers a completed result over a partial preview", () => {
+  let acc = collectImageFromEvent({
+    type: "response.image_generation_call.partial_image",
+    partial_image_b64: "partial",
+    revised_prompt: "draft",
+  });
+  acc = collectImageFromEvent(
+    {
+      type: "response.output_item.done",
+      item: { type: "image_generation_call", result: "final", revised_prompt: "final prompt" },
+    },
+    acc,
+  );
+  assert.equal(acc.b64, "final");
+  assert.equal(acc.partial, false);
+  assert.equal(acc.revised_prompt, "final prompt");
+});
+
+test("buildImageGenerationResponse shapes an OpenAI images payload", () => {
+  const res = buildImageGenerationResponse({ created: 1, b64: "abc", revisedPrompt: "apple" });
+  assert.deepEqual(res, { created: 1, data: [{ b64_json: "abc", revised_prompt: "apple" }] });
 });

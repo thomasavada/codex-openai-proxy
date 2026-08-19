@@ -1,15 +1,31 @@
 import { createServer as createHttpServer } from "node:http";
 import { randomUUID, timingSafeEqual } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { getAccessToken, resolveAuthPath } from "./auth.js";
 import {
   chatCompletionsToResponsesRequest,
+  imageGenerationsToResponsesRequest,
   parseSSEEvents,
   responsesEventToChatChunk,
+  collectImageFromEvent,
   buildChatCompletionResponse,
+  buildImageGenerationResponse,
 } from "./convert.js";
 import { listModels } from "./models.js";
 
 const BACKEND_URL = "https://chatgpt.com/backend-api/codex/responses";
+const AGENT_GUIDE_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "agent.md");
+const AGENT_GUIDE_ROUTES = new Set(["/agent.md", "/llms.txt", "/AGENTS.md"]);
+
+function requestPath(req) {
+  try {
+    return new URL(req.url ?? "/", "http://localhost").pathname;
+  } catch {
+    return req.url ?? "/";
+  }
+}
 
 function sendJson(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -125,26 +141,96 @@ async function handleChatCompletions(req, res, ctx) {
   }
 }
 
+async function handleImageGenerations(req, res, ctx) {
+  let imageReq;
+  try {
+    imageReq = await readJsonBody(req);
+  } catch {
+    return jsonError(res, 400, "Invalid JSON body");
+  }
+  if (!imageReq.prompt || !String(imageReq.prompt).trim()) {
+    return jsonError(res, 400, "`prompt` is required");
+  }
+
+  const responsesReq = imageGenerationsToResponsesRequest(imageReq);
+  let auth = await getAccessToken(ctx.authPath);
+  let backendRes = await callBackend(responsesReq, auth);
+
+  if (backendRes.status === 401) {
+    auth = await getAccessToken(ctx.authPath, { forceRefresh: true });
+    backendRes = await callBackend(responsesReq, auth);
+  }
+
+  if (!backendRes.ok) {
+    const text = await backendRes.text().catch(() => "");
+    return jsonErrorSafe(res, backendRes.status, "Codex backend request failed", text.slice(0, 2000));
+  }
+
+  let buffer = "";
+  let image = {};
+  const reader = backendRes.body.getReader();
+  const decoder = new TextDecoder();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const { events, remainder } = parseSSEEvents(decoder.decode(value, { stream: true }), buffer);
+    buffer = remainder;
+    for (const event of events) image = collectImageFromEvent(event, image);
+  }
+
+  if (!image.b64) {
+    return jsonError(res, 502, "Image generation produced no image");
+  }
+
+  sendJson(
+    res,
+    200,
+    buildImageGenerationResponse({
+      created: Math.floor(Date.now() / 1000),
+      b64: image.b64,
+      revisedPrompt: image.revised_prompt,
+    }),
+  );
+}
+
+async function handleAgentGuide(res) {
+  const markdown = await readFile(AGENT_GUIDE_PATH, "utf8");
+  res.writeHead(200, {
+    "Content-Type": "text/markdown; charset=utf-8",
+    "Cache-Control": "no-cache",
+  });
+  res.end(markdown);
+}
+
 export function createServer({ authPath: explicitAuthPath, apiKey } = {}) {
   const authPath = resolveAuthPath(explicitAuthPath);
   const ctx = { authPath };
 
   return createHttpServer(async (req, res) => {
     try {
-      if (req.method === "GET" && req.url === "/health") {
+      const path = requestPath(req);
+
+      if (req.method === "GET" && path === "/health") {
         return sendJson(res, 200, { status: "ok" });
+      }
+      if (req.method === "GET" && AGENT_GUIDE_ROUTES.has(path)) {
+        return await handleAgentGuide(res);
       }
 
       if (!isAuthorized(req, apiKey)) {
         return jsonError(res, 401, "Missing or invalid API key");
       }
 
-      if (req.method === "GET" && req.url === "/v1/models") {
+      if (req.method === "GET" && path === "/v1/models") {
         const models = await listModels(ctx.authPath);
         return sendJson(res, 200, { object: "list", data: models });
       }
-      if (req.method === "POST" && req.url === "/v1/chat/completions") {
+      if (req.method === "POST" && path === "/v1/chat/completions") {
         return await handleChatCompletions(req, res, ctx);
+      }
+      if (req.method === "POST" && path === "/v1/images/generations") {
+        return await handleImageGenerations(req, res, ctx);
       }
       jsonError(res, 404, "Not found");
     } catch (err) {

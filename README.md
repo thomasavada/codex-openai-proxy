@@ -58,8 +58,10 @@ ran the Codex CLI).
 ## Endpoints
 
 - `GET /health` — status check
+- `GET /agent.md` — agent guide (`text/markdown`; also `/llms.txt`, `/AGENTS.md`)
 - `GET /v1/models` — model slugs available to your account
 - `POST /v1/chat/completions` — OpenAI-compatible chat completions, streaming and non-streaming
+- `POST /v1/images/generations` — OpenAI-compatible image generation (one PNG as `b64_json`)
 
 ## How it works
 
@@ -70,12 +72,6 @@ access token. The access token is refreshed automatically (via
 `https://auth.openai.com/oauth/token`) when it's expired or close to expiry,
 mirroring what the Codex CLI itself does, and the refreshed tokens are written
 back to `auth.json`.
-
-## Not yet implemented
-
-Image generation is possible through the same backend/auth (verified via the
-`image_generation` tool on the Responses API), but there's no
-`/v1/images/generations` endpoint yet — out of scope for this first version.
 
 ## Tests
 
