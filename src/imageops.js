@@ -205,6 +205,9 @@ let backendsPromise;
 
 async function probeBackends() {
   const backends = { pillow: false, sips: false };
+  // Escape hatch for exercising a specific path (the fallback is otherwise
+  // unreachable on any host that has Pillow).
+  const forced = process.env.CODEX_PROXY_IMAGE_BACKEND;
   try {
     await run("python3", ["-c", "from PIL import Image, features; assert features.check('webp')"]);
     backends.pillow = true;
@@ -217,6 +220,9 @@ async function probeBackends() {
   } catch {
     // Not macOS, or sips unavailable.
   }
+  if (forced === "sips") backends.pillow = false;
+  if (forced === "pillow") backends.sips = false;
+  if (forced === "none") return { pillow: false, sips: false };
   return backends;
 }
 

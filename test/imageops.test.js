@@ -10,6 +10,7 @@ import {
   canvasHint,
   transformImage,
   availableBackends,
+  resetBackendCache,
 } from "../src/imageops.js";
 
 test("parseSize accepts explicit pixel dimensions", () => {
@@ -168,4 +169,83 @@ test("transformImage returns the original bytes rather than throwing on a bad in
   });
   assert.equal(result.transformed, false);
   assert.match(result.reason, /transform failed|no local image backend/);
+});
+
+// The sips path is unreachable on a host that has Pillow, so force it. sips can
+// only *write* png and jpeg, which is why webp falls back to "untransformed".
+test(
+  "the sips fallback hits the exact frame for png and jpeg",
+  { skip: backends.sips ? false : "needs sips (macOS)" },
+  async () => {
+    process.env.CODEX_PROXY_IMAGE_BACKEND = "sips";
+    resetBackendCache();
+    try {
+      const source = makeSourcePng(1672, 941);
+      for (const [format, expected, fit] of [
+        ["png", "PNG", "cover"],
+        ["jpeg", "JPEG", "cover"],
+        ["png", "PNG", "contain"],
+        ["png", "PNG", "fill"],
+      ]) {
+        const result = await transformImage(source, {
+          width: 728,
+          height: 90,
+          format,
+          fit,
+          background: "#ffffff",
+        });
+        assert.equal(result.backend, "sips", `${format}/${fit} should use sips`);
+        assert.deepEqual(dimensionsOf(result.buffer), { width: 728, height: 90, format: expected });
+      }
+    } finally {
+      delete process.env.CODEX_PROXY_IMAGE_BACKEND;
+      resetBackendCache();
+    }
+  },
+);
+
+test(
+  "webp degrades gracefully when only sips is available",
+  { skip: backends.sips ? false : "needs sips (macOS)" },
+  async () => {
+    process.env.CODEX_PROXY_IMAGE_BACKEND = "sips";
+    resetBackendCache();
+    try {
+      const source = makeSourcePng(400, 400);
+      const result = await transformImage(source, {
+        width: 300,
+        height: 250,
+        format: "webp",
+        fit: "cover",
+        background: "transparent",
+      });
+      assert.equal(result.transformed, false);
+      assert.match(result.reason, /webp/);
+      assert.equal(result.buffer, source);
+    } finally {
+      delete process.env.CODEX_PROXY_IMAGE_BACKEND;
+      resetBackendCache();
+    }
+  },
+);
+
+test("with no local backend the original image is returned with a reason", async () => {
+  process.env.CODEX_PROXY_IMAGE_BACKEND = "none";
+  resetBackendCache();
+  try {
+    const source = makeSourcePng(400, 400);
+    const result = await transformImage(source, {
+      width: 300,
+      height: 250,
+      format: "png",
+      fit: "cover",
+      background: "transparent",
+    });
+    assert.equal(result.transformed, false);
+    assert.match(result.reason, /no local image backend/);
+    assert.equal(result.buffer, source);
+  } finally {
+    delete process.env.CODEX_PROXY_IMAGE_BACKEND;
+    resetBackendCache();
+  }
 });
