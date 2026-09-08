@@ -9,6 +9,8 @@ function parseArgs(argv) {
     else if (argv[i] === "--host") args.host = argv[++i];
     else if (argv[i] === "--auth-path") args.authPath = argv[++i];
     else if (argv[i] === "--api-key") args.apiKey = argv[++i];
+    else if (argv[i] === "--allow-remote-images") args.allowRemoteImages = true;
+    else if (argv[i] === "--max-body-mb") args.maxBodyMb = Number(argv[++i]);
   }
   return args;
 }
@@ -22,8 +24,18 @@ const port = cli.port || Number(process.env.PORT) || 8080;
 const host = cli.host || process.env.HOST || "127.0.0.1";
 const authPath = cli.authPath || process.env.CODEX_AUTH_PATH;
 const apiKey = cli.apiKey || process.env.PROXY_API_KEY || randomUUID();
+// Off by default: fetching caller-supplied URLs would let anyone with the API
+// key use this host as an SSRF pivot into whatever it can reach.
+const allowRemoteImages =
+  cli.allowRemoteImages || process.env.ALLOW_REMOTE_IMAGES === "1" || false;
+const maxBodyMb = cli.maxBodyMb || Number(process.env.MAX_BODY_MB) || 32;
 
-const server = createServer({ authPath, apiKey });
+const server = createServer({
+  authPath,
+  apiKey,
+  allowRemoteImages,
+  maxBodyBytes: maxBodyMb * 1024 * 1024,
+});
 server.listen(port, host, () => {
   console.log(`codex-openai-proxy listening on http://${host}:${port}`);
   console.log(`API key (send as "Authorization: Bearer <key>"): ${apiKey}`);

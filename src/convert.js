@@ -1,3 +1,7 @@
+import { canvasHint, detectImageMime } from "./imageops.js";
+
+export const DEFAULT_IMAGE_ORCHESTRATOR = "gpt-5.4-mini";
+
 function extractText(content) {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -99,10 +103,11 @@ const IMAGE_MODEL_SLUGS = new Set([
   "gpt-image-2",
 ]);
 
-const DEFAULT_IMAGE_ORCHESTRATOR = "gpt-5.4";
-
-function orchestratorModel(model) {
-  if (!model || IMAGE_MODEL_SLUGS.has(model)) return DEFAULT_IMAGE_ORCHESTRATOR;
+// Callers routinely pass an OpenAI image-model slug the Codex backend has never
+// heard of; those get swapped for a chat model that drives the image tool. Any
+// other slug is a deliberate orchestrator choice and is left alone.
+export function orchestratorModel(model, fallback) {
+  if (!model || IMAGE_MODEL_SLUGS.has(model)) return fallback;
   return model;
 }
 
@@ -112,18 +117,98 @@ function mapImageQuality(quality) {
   return quality || "medium";
 }
 
-export function imageGenerationsToResponsesRequest(imageReq) {
+const MAX_REFERENCE_IMAGES = 8;
+
+/**
+ * Normalise one reference image into a Responses `input_image` content part.
+ * Accepts a data URL, bare base64, a Buffer (multipart upload) or — only when
+ * `allowRemote` is set — an http(s) URL. Remote URLs are opt-in because this
+ * proxy is reachable from outside the host it runs on, and fetching arbitrary
+ * URLs on a caller's behalf turns it into an SSRF pivot.
+ */
+export function toInputImage(value, { allowRemote = false } = {}) {
+  if (Buffer.isBuffer(value)) {
+    const mime = detectImageMime(value);
+    if (!mime) throw new Error("Reference image is not a PNG, JPEG, WebP or GIF");
+    return { type: "input_image", image_url: `data:${mime};base64,${value.toString("base64")}` };
+  }
+
+  const raw = String(value ?? "").trim();
+  if (!raw) throw new Error("Reference image is empty");
+
+  if (raw.startsWith("data:")) {
+    if (!/^data:image\/[a-z0-9.+-]+;base64,/i.test(raw)) {
+      throw new Error("Reference image data URL must be base64-encoded image/* data");
+    }
+    return { type: "input_image", image_url: raw };
+  }
+
+  if (/^https?:\/\//i.test(raw)) {
+    if (!allowRemote) {
+      throw new Error(
+        "Reference images by URL are disabled. Send base64 or a data: URL, or start the proxy with --allow-remote-images.",
+      );
+    }
+    return { type: "input_image", image_url: raw };
+  }
+
+  if (/^[A-Za-z0-9+/=\s]+$/.test(raw) && raw.length > 32) {
+    return toInputImage(Buffer.from(raw.replace(/\s+/g, ""), "base64"), { allowRemote });
+  }
+
+  throw new Error("Reference image must be base64, a data: URL or an http(s) URL");
+}
+
+export function toInputImages(images, options) {
+  if (images === undefined || images === null || images === "") return [];
+  const list = Array.isArray(images) ? images : [images];
+  if (list.length > MAX_REFERENCE_IMAGES) {
+    throw new Error(`At most ${MAX_REFERENCE_IMAGES} reference images are supported`);
+  }
+  return list.map((image) => toInputImage(image, options));
+}
+
+/**
+ * Build the Responses request for an image generation or edit.
+ *
+ * `size` never reaches the backend as a hard constraint — the upstream tool
+ * picks its own canvas and ignores it — so the target frame is also described
+ * in the prompt, and the server crops the result to the exact pixels afterwards.
+ */
+export function imageGenerationsToResponsesRequest(imageReq, options = {}) {
+  const {
+    fallbackModel = DEFAULT_IMAGE_ORCHESTRATOR,
+    dimensions = null,
+    outputFormat = "png",
+    allowRemote = false,
+  } = options;
+
   const prompt = String(imageReq.prompt ?? "").trim();
-  const tool = { type: "image_generation", quality: mapImageQuality(imageReq.quality) };
-  if (imageReq.size && imageReq.size !== "auto") tool.size = imageReq.size;
+  const references = toInputImages(imageReq.image ?? imageReq.images, { allowRemote });
+
+  const tool = {
+    type: "image_generation",
+    quality: mapImageQuality(imageReq.quality),
+    output_format: outputFormat,
+  };
+  if (dimensions) tool.size = `${dimensions.width}x${dimensions.height}`;
+  if (imageReq.background === "opaque" || imageReq.background === "transparent") {
+    tool.background = imageReq.background;
+  }
+
+  const verb = references.length
+    ? "Edit the attached reference image(s) as follows."
+    : "Draw the following image.";
+  const text = `${verb} ${prompt}${dimensions ? canvasHint(dimensions) : ""}`;
+
   return {
-    model: orchestratorModel(imageReq.model),
+    model: orchestratorModel(imageReq.model, fallbackModel),
     instructions: "You are a helpful assistant that generates images.",
     input: [
       {
         type: "message",
         role: "user",
-        content: [{ type: "input_text", text: `Draw the following image. ${prompt}` }],
+        content: [...references, { type: "input_text", text }],
       },
     ],
     tools: [tool],
@@ -169,8 +254,25 @@ export function collectImageFromEvent(event, acc = {}) {
   return next;
 }
 
-export function buildImageGenerationResponse({ created, b64, revisedPrompt }) {
+export function buildImageGenerationResponse({
+  created,
+  b64,
+  revisedPrompt,
+  outputFormat,
+  size,
+  quality,
+  background,
+  warning,
+}) {
   const entry = { b64_json: b64 };
   if (revisedPrompt) entry.revised_prompt = revisedPrompt;
-  return { created, data: [entry] };
+  const response = { created, data: [entry] };
+  if (outputFormat) response.output_format = outputFormat;
+  if (size) response.size = size;
+  if (quality) response.quality = quality;
+  if (background) response.background = background;
+  // Surfaced instead of failing: the image is real, only the requested frame
+  // could not be applied locally.
+  if (warning) response.warning = warning;
+  return response;
 }

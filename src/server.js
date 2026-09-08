@@ -13,11 +13,26 @@ import {
   buildChatCompletionResponse,
   buildImageGenerationResponse,
 } from "./convert.js";
-import { listModels } from "./models.js";
+import { listModels, resolveImageOrchestrator } from "./models.js";
+import { parseMultipart } from "./multipart.js";
+import {
+  SIZE_PRESETS,
+  OUTPUT_FORMATS,
+  parseSize,
+  parseOutputFormat,
+  parseFit,
+  parseBackground,
+  transformImage,
+  availableBackends,
+} from "./imageops.js";
 
 const BACKEND_URL = "https://chatgpt.com/backend-api/codex/responses";
 const AGENT_GUIDE_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "agent.md");
 const AGENT_GUIDE_ROUTES = new Set(["/agent.md", "/llms.txt", "/AGENTS.md"]);
+// Reference images arrive inline (base64 or multipart), so bodies are far
+// bigger than a chat request — but still bounded, or a single caller can pin
+// the process's memory.
+const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024;
 
 function requestPath(req) {
   try {
@@ -54,11 +69,34 @@ function isAuthorized(req, apiKey) {
   return timingSafeEqual(providedBuf, expectedBuf);
 }
 
-async function readJsonBody(req) {
+class BodyTooLargeError extends Error {}
+
+async function readBody(req, maxBytes) {
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  const raw = Buffer.concat(chunks).toString("utf8");
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > maxBytes) throw new BodyTooLargeError();
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+async function readJsonBody(req, maxBytes) {
+  const raw = (await readBody(req, maxBytes)).toString("utf8");
   return raw ? JSON.parse(raw) : {};
+}
+
+// Accepts both the OpenAI SDK's multipart upload and a plain JSON body, so the
+// same endpoint works from `openai.images.edit()` and from a curl one-liner.
+async function readImageRequest(req, maxBytes) {
+  const contentType = req.headers["content-type"] || "";
+  if (!contentType.toLowerCase().startsWith("multipart/form-data")) {
+    return await readJsonBody(req, maxBytes);
+  }
+  const { fields, files } = parseMultipart(await readBody(req, maxBytes), contentType);
+  const images = (files.image ?? []).map((file) => file.data);
+  return { ...fields, ...(images.length ? { image: images } : {}) };
 }
 
 function callBackend(responsesReq, { accessToken, accountId }) {
@@ -80,8 +118,11 @@ function callBackend(responsesReq, { accessToken, accountId }) {
 async function handleChatCompletions(req, res, ctx) {
   let chatReq;
   try {
-    chatReq = await readJsonBody(req);
-  } catch {
+    chatReq = await readJsonBody(req, ctx.maxBodyBytes);
+  } catch (err) {
+    if (err instanceof BodyTooLargeError) {
+      return jsonError(res, 413, `Request body exceeds ${ctx.maxBodyBytes} bytes`);
+    }
     return jsonError(res, 400, "Invalid JSON body");
   }
   if (!chatReq.model || !Array.isArray(chatReq.messages)) {
@@ -141,18 +182,52 @@ async function handleChatCompletions(req, res, ctx) {
   }
 }
 
-async function handleImageGenerations(req, res, ctx) {
+// Shared by /v1/images/generations and /v1/images/edits — the only difference
+// between them is whether reference images came along.
+async function handleImages(req, res, ctx, { requireImage = false } = {}) {
   let imageReq;
   try {
-    imageReq = await readJsonBody(req);
-  } catch {
-    return jsonError(res, 400, "Invalid JSON body");
+    imageReq = await readImageRequest(req, ctx.maxBodyBytes);
+  } catch (err) {
+    if (err instanceof BodyTooLargeError) {
+      return jsonError(res, 413, `Request body exceeds ${ctx.maxBodyBytes} bytes`);
+    }
+    return jsonError(res, 400, "Invalid request body");
   }
+
   if (!imageReq.prompt || !String(imageReq.prompt).trim()) {
     return jsonError(res, 400, "`prompt` is required");
   }
+  if (requireImage && !imageReq.image && !imageReq.images) {
+    return jsonError(res, 400, "`image` is required for edits");
+  }
+  if (imageReq.mask) {
+    return jsonError(res, 400, "`mask` (inpainting) is not supported by this backend");
+  }
+  if (imageReq.response_format && imageReq.response_format !== "b64_json") {
+    return jsonError(res, 400, "Only `response_format: \"b64_json\"` is supported");
+  }
 
-  const responsesReq = imageGenerationsToResponsesRequest(imageReq);
+  let dimensions;
+  let outputFormat;
+  let fit;
+  let background;
+  let responsesReq;
+  try {
+    dimensions = parseSize(imageReq.size);
+    outputFormat = parseOutputFormat(imageReq.output_format);
+    fit = parseFit(imageReq.fit);
+    background = parseBackground(imageReq.background);
+    responsesReq = imageGenerationsToResponsesRequest(imageReq, {
+      fallbackModel: await resolveImageOrchestrator(ctx.authPath),
+      dimensions,
+      outputFormat,
+      allowRemote: ctx.allowRemoteImages,
+    });
+  } catch (err) {
+    return jsonError(res, 400, err.message);
+  }
+
   let auth = await getAccessToken(ctx.authPath);
   let backendRes = await callBackend(responsesReq, auth);
 
@@ -183,13 +258,35 @@ async function handleImageGenerations(req, res, ctx) {
     return jsonError(res, 502, "Image generation produced no image");
   }
 
+  // The upstream tool ignores `size` and returns whatever canvas it picked, so
+  // the requested frame is applied here.
+  let b64 = image.b64;
+  let warning;
+  if (dimensions) {
+    const result = await transformImage(Buffer.from(image.b64, "base64"), {
+      ...dimensions,
+      format: outputFormat,
+      fit,
+      background,
+    });
+    b64 = result.buffer.toString("base64");
+    if (!result.transformed && fit !== "none") {
+      warning = `Returned at the model's own canvas size: ${result.reason}`;
+    }
+  }
+
   sendJson(
     res,
     200,
     buildImageGenerationResponse({
       created: Math.floor(Date.now() / 1000),
-      b64: image.b64,
+      b64,
       revisedPrompt: image.revised_prompt,
+      outputFormat,
+      size: dimensions ? `${dimensions.width}x${dimensions.height}` : "auto",
+      quality: responsesReq.tools[0].quality,
+      background: imageReq.background,
+      warning,
     }),
   );
 }
@@ -203,9 +300,14 @@ async function handleAgentGuide(res) {
   res.end(markdown);
 }
 
-export function createServer({ authPath: explicitAuthPath, apiKey } = {}) {
+export function createServer({
+  authPath: explicitAuthPath,
+  apiKey,
+  allowRemoteImages = false,
+  maxBodyBytes = DEFAULT_MAX_BODY_BYTES,
+} = {}) {
   const authPath = resolveAuthPath(explicitAuthPath);
-  const ctx = { authPath };
+  const ctx = { authPath, allowRemoteImages, maxBodyBytes };
 
   return createHttpServer(async (req, res) => {
     try {
@@ -229,8 +331,20 @@ export function createServer({ authPath: explicitAuthPath, apiKey } = {}) {
       if (req.method === "POST" && path === "/v1/chat/completions") {
         return await handleChatCompletions(req, res, ctx);
       }
+      if (req.method === "GET" && path === "/v1/images/sizes") {
+        return sendJson(res, 200, {
+          object: "list",
+          formats: OUTPUT_FORMATS,
+          fits: ["cover", "contain", "fill", "none"],
+          local_backends: await availableBackends(),
+          data: Object.entries(SIZE_PRESETS).map(([name, size]) => ({ name, size })),
+        });
+      }
       if (req.method === "POST" && path === "/v1/images/generations") {
-        return await handleImageGenerations(req, res, ctx);
+        return await handleImages(req, res, ctx);
+      }
+      if (req.method === "POST" && path === "/v1/images/edits") {
+        return await handleImages(req, res, ctx, { requireImage: true });
       }
       jsonError(res, 404, "Not found");
     } catch (err) {

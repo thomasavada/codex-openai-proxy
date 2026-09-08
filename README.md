@@ -43,6 +43,8 @@ ran the Codex CLI).
 | `--host` / `HOST` | `127.0.0.1` | Interface to bind to — keep this on loopback unless you know you want it reachable from elsewhere |
 | `--auth-path` / `CODEX_AUTH_PATH` | `~/.codex/auth.json` | Path to Codex CLI's auth file |
 | `--api-key` / `PROXY_API_KEY` | randomly generated at startup | Bearer token clients must send; required because this proxy rides your live ChatGPT session with no other access control |
+| `--allow-remote-images` / `ALLOW_REMOTE_IMAGES=1` | off | Let callers pass reference images as http(s) URLs. Off by default: the proxy would otherwise fetch arbitrary URLs on a caller's behalf, from wherever it runs |
+| `--max-body-mb` / `MAX_BODY_MB` | `32` | Request body cap. Reference images are inlined, so bodies get large — but bounded |
 
 ## Security notes
 
@@ -61,7 +63,31 @@ ran the Codex CLI).
 - `GET /agent.md` — agent guide (`text/markdown`; also `/llms.txt`, `/AGENTS.md`)
 - `GET /v1/models` — model slugs available to your account
 - `POST /v1/chat/completions` — OpenAI-compatible chat completions, streaming and non-streaming
-- `POST /v1/images/generations` — OpenAI-compatible image generation (one PNG as `b64_json`)
+- `GET /v1/images/sizes` — named frame presets (banner/ad/social) and supported formats
+- `POST /v1/images/generations` — image generation; PNG, JPEG or WebP as `b64_json`
+- `POST /v1/images/edits` — image generation guided by reference images (JSON base64 or multipart)
+
+## Images
+
+`size` accepts `1200x628` or a preset name (`leaderboard`, `og`, `story`, `mrec`, …;
+`GET /v1/images/sizes` lists them all), `output_format` accepts `png` / `jpeg` / `webp`,
+and `image` accepts one or more reference images as base64, a `data:` URL, or multipart
+file parts.
+
+```bash
+curl http://localhost:8080/v1/images/edits \
+  -H "Authorization: Bearer <key>" \
+  -F "image=@logo.png" \
+  -F "prompt=Put this logo on a mint-green promo banner" \
+  -F "size=leaderboard" -F "output_format=webp"
+```
+
+The upstream image tool picks its own canvas and ignores a requested size, so the proxy
+describes the target frame in the prompt and then crops the result to exact pixels
+(`fit`: `cover` by default, or `contain` / `fill` / `none`). That local step uses Pillow
+(`python3 -m pip install pillow`) if present, otherwise `sips` on macOS for PNG and JPEG.
+With neither available the image still comes back — at the model's own size, with a
+`warning` field explaining why.
 
 ## How it works
 
