@@ -225,6 +225,26 @@ test("responsesEventToChatChunk finishes as tool_calls when one was seen", () =>
   assert.equal(chunk.choices[0].finish_reason, "tool_calls");
 });
 
+test("responsesEventToChatChunk labels deltas as assistant", () => {
+  // Without a role, LangChain builds a generic ChatMessageChunk and later fails
+  // with "Unable to coerce message from array" when the history is replayed.
+  const text = responsesEventToChatChunk(
+    { type: "response.output_text.delta", delta: "Hi" },
+    { id: "id1", model: "m", created: 1 },
+  );
+  assert.equal(text.choices[0].delta.role, "assistant");
+
+  const call = responsesEventToChatChunk(
+    {
+      type: "response.output_item.done",
+      output_index: 0,
+      item: { type: "function_call", call_id: "c1", name: "f", arguments: "{}" },
+    },
+    { id: "id1", model: "m", created: 1 },
+  );
+  assert.equal(call.choices[0].delta.role, "assistant");
+});
+
 test("imageGenerationsToResponsesRequest forces the image_generation tool", () => {
   const req = imageGenerationsToResponsesRequest(
     { prompt: "a red apple" },

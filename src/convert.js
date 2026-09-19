@@ -150,7 +150,7 @@ export function responsesEventToChatChunk(event, { id, model, created, toolCalls
       object: "chat.completion.chunk",
       created,
       model,
-      choices: [{ index: 0, delta: { content: event.delta }, finish_reason: null }],
+      choices: [{ index: 0, delta: { role: "assistant", content: event.delta }, finish_reason: null }],
     };
   }
   const toolCall = collectToolCallFromEvent(event);
@@ -163,7 +163,7 @@ export function responsesEventToChatChunk(event, { id, model, created, toolCalls
       choices: [
         {
           index: 0,
-          delta: { tool_calls: [{ index: event.output_index ?? 0, ...toolCall }] },
+          delta: { role: "assistant", tool_calls: [{ index: event.output_index ?? 0, ...toolCall }] },
           finish_reason: null,
         },
       ],
