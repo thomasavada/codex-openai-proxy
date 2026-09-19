@@ -7,6 +7,8 @@ import {
   responsesEventToChatChunk,
   collectImageFromEvent,
   buildChatCompletionResponse,
+  collectToolCallFromEvent,
+  DEFAULT_INSTRUCTIONS,
   buildImageGenerationResponse,
   toInputImage,
   toInputImages,
@@ -82,6 +84,145 @@ test("buildChatCompletionResponse shapes a non-streaming response", () => {
   const res = buildChatCompletionResponse({ id: "id1", model: "m", created: 1, content: "hi" });
   assert.equal(res.object, "chat.completion");
   assert.equal(res.choices[0].message.content, "hi");
+});
+
+// Each of the next three covers a shape the Codex backend rejected outright;
+// the quoted text is the upstream error they used to produce.
+test("chatCompletionsToResponsesRequest hoists system messages into instructions", () => {
+  const req = chatCompletionsToResponsesRequest({
+    model: "gpt-reserve",
+    messages: [
+      { role: "system", content: "You are Joy." },
+      { role: "user", content: "Hello" },
+    ],
+  });
+  // Upstream: {"detail":"System messages are not allowed"}
+  assert.equal(req.instructions, "You are Joy.");
+  assert.equal(req.input.length, 1);
+  assert.equal(req.input[0].role, "user");
+});
+
+test("chatCompletionsToResponsesRequest falls back to default instructions", () => {
+  const req = chatCompletionsToResponsesRequest({
+    model: "gpt-reserve",
+    messages: [{ role: "user", content: "Hello" }],
+  });
+  assert.equal(req.instructions, DEFAULT_INSTRUCTIONS);
+});
+
+test("chatCompletionsToResponsesRequest joins multiple system messages", () => {
+  const req = chatCompletionsToResponsesRequest({
+    model: "gpt-reserve",
+    messages: [
+      { role: "system", content: "One." },
+      { role: "system", content: "Two." },
+      { role: "user", content: "Hello" },
+    ],
+  });
+  assert.equal(req.instructions, "One.\n\nTwo.");
+});
+
+test("chatCompletionsToResponsesRequest emits output_text for assistant turns", () => {
+  const req = chatCompletionsToResponsesRequest({
+    model: "gpt-reserve",
+    messages: [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "hello" },
+      { role: "user", content: "again" },
+    ],
+  });
+  // Upstream: "Invalid value: 'input_text'. Supported values are: 'output_text' and 'refusal'."
+  assert.equal(req.input[1].content[0].type, "output_text");
+  assert.equal(req.input[0].content[0].type, "input_text");
+});
+
+test("chatCompletionsToResponsesRequest flattens function tools", () => {
+  const req = chatCompletionsToResponsesRequest({
+    model: "gpt-reserve",
+    messages: [{ role: "user", content: "hi" }],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "get_weather",
+          description: "Get weather",
+          parameters: { type: "object", properties: { city: { type: "string" } } },
+        },
+      },
+    ],
+  });
+  // Upstream: "Missing required parameter: 'tools[0].name'."
+  assert.equal(req.tools[0].name, "get_weather");
+  assert.equal(req.tools[0].type, "function");
+  assert.equal(req.tools[0].parameters.properties.city.type, "string");
+  assert.equal(req.tools[0].function, undefined);
+});
+
+test("chatCompletionsToResponsesRequest maps a tool round-trip", () => {
+  const req = chatCompletionsToResponsesRequest({
+    model: "gpt-reserve",
+    messages: [
+      { role: "user", content: "weather?" },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          { id: "call_1", type: "function", function: { name: "get_weather", arguments: '{"city":"Hanoi"}' } },
+        ],
+      },
+      { role: "tool", tool_call_id: "call_1", content: "31C" },
+    ],
+  });
+  assert.deepEqual(req.input[1], {
+    type: "function_call",
+    call_id: "call_1",
+    name: "get_weather",
+    arguments: '{"city":"Hanoi"}',
+  });
+  assert.deepEqual(req.input[2], {
+    type: "function_call_output",
+    call_id: "call_1",
+    output: "31C",
+  });
+});
+
+test("chatCompletionsToResponsesRequest flattens a named tool_choice", () => {
+  const req = chatCompletionsToResponsesRequest({
+    model: "gpt-reserve",
+    messages: [{ role: "user", content: "hi" }],
+    tool_choice: { type: "function", function: { name: "get_weather" } },
+  });
+  assert.deepEqual(req.tool_choice, { type: "function", name: "get_weather" });
+});
+
+test("collectToolCallFromEvent picks up a finished function call", () => {
+  const call = collectToolCallFromEvent({
+    type: "response.output_item.done",
+    item: { type: "function_call", call_id: "call_1", name: "get_weather", arguments: '{"city":"Hanoi"}' },
+  });
+  assert.equal(call.id, "call_1");
+  assert.equal(call.function.name, "get_weather");
+  assert.equal(collectToolCallFromEvent({ type: "response.completed" }), null);
+});
+
+test("buildChatCompletionResponse reports tool_calls as the finish reason", () => {
+  const res = buildChatCompletionResponse({
+    id: "id1",
+    model: "m",
+    created: 1,
+    content: "",
+    toolCalls: [{ id: "call_1", type: "function", function: { name: "f", arguments: "{}" } }],
+  });
+  assert.equal(res.choices[0].finish_reason, "tool_calls");
+  assert.equal(res.choices[0].message.tool_calls[0].id, "call_1");
+});
+
+test("responsesEventToChatChunk finishes as tool_calls when one was seen", () => {
+  const chunk = responsesEventToChatChunk(
+    { type: "response.completed" },
+    { id: "id1", model: "m", created: 1, toolCallsSeen: true },
+  );
+  assert.equal(chunk.choices[0].finish_reason, "tool_calls");
 });
 
 test("imageGenerationsToResponsesRequest forces the image_generation tool", () => {

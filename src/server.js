@@ -9,6 +9,7 @@ import {
   imageGenerationsToResponsesRequest,
   parseSSEEvents,
   responsesEventToChatChunk,
+  collectToolCallFromEvent,
   collectImageFromEvent,
   buildChatCompletionResponse,
   buildImageGenerationResponse,
@@ -157,6 +158,7 @@ async function handleChatCompletions(req, res, ctx) {
 
   let buffer = "";
   let content = "";
+  const toolCalls = [];
   const reader = backendRes.body.getReader();
   const decoder = new TextDecoder();
 
@@ -167,8 +169,15 @@ async function handleChatCompletions(req, res, ctx) {
     buffer = remainder;
     for (const event of events) {
       if (event.type === "response.output_text.delta") content += event.delta;
+      const toolCall = collectToolCallFromEvent(event);
+      if (toolCall) toolCalls.push(toolCall);
       if (wantsStream) {
-        const chunk = responsesEventToChatChunk(event, { id, model: chatReq.model, created });
+        const chunk = responsesEventToChatChunk(event, {
+          id,
+          model: chatReq.model,
+          created,
+          toolCallsSeen: toolCalls.length > 0,
+        });
         if (chunk) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
       }
     }
@@ -178,7 +187,11 @@ async function handleChatCompletions(req, res, ctx) {
     res.write("data: [DONE]\n\n");
     res.end();
   } else {
-    sendJson(res, 200, buildChatCompletionResponse({ id, model: chatReq.model, created, content }));
+    sendJson(
+      res,
+      200,
+      buildChatCompletionResponse({ id, model: chatReq.model, created, content, toolCalls }),
+    );
   }
 }
 

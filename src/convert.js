@@ -13,21 +13,109 @@ function extractText(content) {
   return content == null ? "" : String(content);
 }
 
+export const DEFAULT_INSTRUCTIONS = "You are a helpful assistant.";
+
+// The Codex backend refuses a `system` role outright ("System messages are not
+// allowed"), and `instructions` is where the Responses API expects that prompt,
+// so hoist it instead of forwarding it. Previously `instructions` was hardcoded,
+// which silently discarded whatever system prompt the caller sent.
+function splitSystem(messages) {
+  const instructions = [];
+  const rest = [];
+  for (const msg of messages) {
+    if (msg.role === "system") {
+      const text = extractText(msg.content);
+      if (text) instructions.push(text);
+      continue;
+    }
+    rest.push(msg);
+  }
+  return { instructions, rest };
+}
+
+// Assistant turns must carry `output_text` — `input_text` is rejected with
+// "Invalid value: 'input_text'". Tool traffic changes item type entirely:
+// a requested call becomes `function_call`, its result `function_call_output`.
+function toInputItems(msg) {
+  if (msg.role === "assistant") {
+    const items = [];
+    const text = extractText(msg.content);
+    if (text) {
+      items.push({ type: "message", role: "assistant", content: [{ type: "output_text", text }] });
+    }
+    for (const call of msg.tool_calls ?? []) {
+      items.push({
+        type: "function_call",
+        call_id: call.id,
+        name: call.function?.name,
+        arguments: call.function?.arguments ?? "{}",
+      });
+    }
+    return items;
+  }
+
+  if (msg.role === "tool") {
+    return [
+      {
+        type: "function_call_output",
+        call_id: msg.tool_call_id,
+        output: extractText(msg.content),
+      },
+    ];
+  }
+
+  return [
+    { type: "message", role: msg.role, content: [{ type: "input_text", text: extractText(msg.content) }] },
+  ];
+}
+
+// Chat Completions nests the schema under `function`; the Responses API wants it
+// flat and rejects the nested shape with "Missing required parameter:
+// 'tools[0].name'". Non-function tools (image_generation) already match.
+function toResponsesTool(tool) {
+  if (tool?.type !== "function" || !tool.function) return tool;
+  const { name, description, parameters, strict } = tool.function;
+  return {
+    type: "function",
+    name,
+    description: description ?? "",
+    parameters: parameters ?? { type: "object", properties: {} },
+    strict: strict ?? false,
+  };
+}
+
+function toResponsesToolChoice(choice) {
+  if (choice?.type === "function" && choice.function?.name) {
+    return { type: "function", name: choice.function.name };
+  }
+  return choice ?? "auto";
+}
+
 export function chatCompletionsToResponsesRequest(chatReq) {
+  const { instructions, rest } = splitSystem(chatReq.messages ?? []);
   return {
     model: chatReq.model,
-    instructions: "You are a helpful assistant.",
-    input: chatReq.messages.map((msg) => ({
-      type: "message",
-      role: msg.role,
-      content: [{ type: "input_text", text: extractText(msg.content) }],
-    })),
-    tools: chatReq.tools ?? [],
-    tool_choice: chatReq.tool_choice ?? "auto",
+    instructions: instructions.length ? instructions.join("\n\n") : DEFAULT_INSTRUCTIONS,
+    input: rest.flatMap(toInputItems),
+    tools: (chatReq.tools ?? []).map(toResponsesTool),
+    tool_choice: toResponsesToolChoice(chatReq.tool_choice),
     parallel_tool_calls: false,
     store: false,
     stream: true,
     include: [],
+  };
+}
+
+// The backend emits a finished function call as a single `output_item.done`
+// event; arguments arrive complete, so there is nothing to accumulate.
+export function collectToolCallFromEvent(event) {
+  if (event?.type !== "response.output_item.done") return null;
+  const item = event.item;
+  if (item?.type !== "function_call") return null;
+  return {
+    id: item.call_id,
+    type: "function",
+    function: { name: item.name, arguments: item.arguments ?? "{}" },
   };
 }
 
@@ -55,7 +143,7 @@ export function parseSSEEvents(rawChunkText, buffer) {
   return { events, remainder };
 }
 
-export function responsesEventToChatChunk(event, { id, model, created }) {
+export function responsesEventToChatChunk(event, { id, model, created, toolCallsSeen = false }) {
   if (event.type === "response.output_text.delta") {
     return {
       id,
@@ -65,19 +153,37 @@ export function responsesEventToChatChunk(event, { id, model, created }) {
       choices: [{ index: 0, delta: { content: event.delta }, finish_reason: null }],
     };
   }
+  const toolCall = collectToolCallFromEvent(event);
+  if (toolCall) {
+    return {
+      id,
+      object: "chat.completion.chunk",
+      created,
+      model,
+      choices: [
+        {
+          index: 0,
+          delta: { tool_calls: [{ index: event.output_index ?? 0, ...toolCall }] },
+          finish_reason: null,
+        },
+      ],
+    };
+  }
   if (event.type === "response.completed") {
     return {
       id,
       object: "chat.completion.chunk",
       created,
       model,
-      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      choices: [{ index: 0, delta: {}, finish_reason: toolCallsSeen ? "tool_calls" : "stop" }],
     };
   }
   return null;
 }
 
-export function buildChatCompletionResponse({ id, model, created, content }) {
+export function buildChatCompletionResponse({ id, model, created, content, toolCalls = [] }) {
+  const message = { role: "assistant", content };
+  if (toolCalls.length) message.tool_calls = toolCalls;
   return {
     id,
     object: "chat.completion",
@@ -86,8 +192,8 @@ export function buildChatCompletionResponse({ id, model, created, content }) {
     choices: [
       {
         index: 0,
-        message: { role: "assistant", content },
-        finish_reason: "stop",
+        message,
+        finish_reason: toolCalls.length ? "tool_calls" : "stop",
       },
     ],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
