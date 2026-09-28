@@ -17,8 +17,16 @@ Do not put the API key in source, prompts, or screenshots. Treat it as a product
 # Chat
 curl https://joy-codex.avada.net/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $PROXY_API_KEY" \
+  -H "Authorization: Bearer <PROXY_API_KEY>" \
   -d '{"model":"gpt-5.4-mini","messages":[{"role":"user","content":"Hello"}]}'
+
+# Responses API with structured web-search evidence
+curl https://joy-codex.avada.net/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <PROXY_API_KEY>" \
+  -d '{"model":"gpt-5.6-sol","input":"Rank Shopify loyalty apps",
+       "tools":[{"type":"web_search"}],
+       "include":["web_search_call.action.sources"],"stream":false}'
 
 # Image → decode data[0].b64_json
 curl https://joy-codex.avada.net/v1/images/generations \
@@ -72,6 +80,7 @@ const png = Buffer.from(img.data[0].b64_json, "base64");
 | `GET` | `/AGENTS.md` | no | Same document |
 | `GET` | `/v1/models` | yes | Live model list for this account |
 | `POST` | `/v1/chat/completions` | yes | Streaming and non-streaming |
+| `POST` | `/v1/responses` | yes | Responses passthrough; preserves built-in tool events, sources and upstream usage |
 | `GET` | `/v1/images/sizes` | yes | Named frame presets + supported formats |
 | `POST` | `/v1/images/generations` | yes | Text → image, optional reference images |
 | `POST` | `/v1/images/edits` | yes | Reference image(s) → image; JSON or multipart |
@@ -96,7 +105,17 @@ Supported models (confirm with `GET /v1/models`):
 
 `stream: true` returns SSE (`text/event-stream`) in OpenAI chunk format, ending with `data: [DONE]`.
 
-Not implemented: vision input, `/v1/responses`, image output inside chat.
+Not implemented in Chat Completions: vision input and image output inside chat. Use `/v1/responses` when a caller needs the native Responses envelope or structured built-in-tool evidence.
+
+---
+
+## Responses API
+
+`POST /v1/responses` accepts the native Responses request shape. The proxy forces `store:false`
+and uses an upstream SSE request internally. With `stream:true`, upstream Responses events are
+forwarded unchanged. With `stream:false`, the proxy returns the completed response object, including
+structured built-in-tool items such as `web_search_call.action.sources` and any usage the Codex
+backend supplies. A single upstream 401 refreshes the Codex OAuth token and retries once.
 
 ---
 

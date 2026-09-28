@@ -122,7 +122,7 @@ export function collectToolCallFromEvent(event) {
 // Splits raw SSE bytes on blank-line event boundaries, parses each `data: ` line
 // as JSON, and returns any leftover partial event text to prepend to the next chunk.
 export function parseSSEEvents(rawChunkText, buffer) {
-  const combined = buffer + rawChunkText;
+  const combined = (buffer + rawChunkText).replace(/\r\n/g, "\n");
   const parts = combined.split("\n\n");
   const remainder = parts.pop() ?? "";
   const events = [];

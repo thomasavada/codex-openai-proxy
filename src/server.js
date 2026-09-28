@@ -100,8 +100,8 @@ async function readImageRequest(req, maxBytes) {
   return { ...fields, ...(images.length ? { image: images } : {}) };
 }
 
-function callBackend(responsesReq, { accessToken, accountId }) {
-  return fetch(BACKEND_URL, {
+function callBackend(responsesReq, { accessToken, accountId }, fetcher = fetch) {
+  return fetcher(BACKEND_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -114,6 +114,99 @@ function callBackend(responsesReq, { accessToken, accountId }) {
     },
     body: JSON.stringify(responsesReq),
   });
+}
+
+async function callBackendWithRefresh(responsesReq, ctx) {
+  let auth = await ctx.tokenProvider(ctx.authPath);
+  let backendRes = await callBackend(responsesReq, auth, ctx.backendFetch);
+  if (backendRes.status === 401) {
+    auth = await ctx.tokenProvider(ctx.authPath, { forceRefresh: true });
+    backendRes = await callBackend(responsesReq, auth, ctx.backendFetch);
+  }
+  return backendRes;
+}
+
+async function handleResponses(req, res, ctx) {
+  let responsesReq;
+  try {
+    responsesReq = await readJsonBody(req, ctx.maxBodyBytes);
+  } catch (err) {
+    if (err instanceof BodyTooLargeError) {
+      return jsonError(res, 413, `Request body exceeds ${ctx.maxBodyBytes} bytes`);
+    }
+    return jsonError(res, 400, "Invalid JSON body");
+  }
+  if (!responsesReq.model || responsesReq.input === undefined) {
+    return jsonError(res, 400, "`model` and `input` are required");
+  }
+
+  const wantsStream = responsesReq.stream === true;
+  const input =
+    typeof responsesReq.input === "string"
+      ? [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: responsesReq.input }],
+          },
+        ]
+      : responsesReq.input;
+  const backendRes = await callBackendWithRefresh(
+    { ...responsesReq, input, store: false, stream: true },
+    ctx,
+  );
+  if (!backendRes.ok) {
+    const text = await backendRes.text().catch(() => "");
+    return jsonErrorSafe(res, backendRes.status, "Codex backend request failed", text.slice(0, 2000));
+  }
+
+  if (wantsStream) {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    const reader = backendRes.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(value);
+    }
+    return res.end();
+  }
+
+  let buffer = "";
+  let terminalResponse;
+  const outputItems = new Map();
+  const reader = backendRes.body.getReader();
+  const decoder = new TextDecoder();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const { events, remainder } = parseSSEEvents(decoder.decode(value, { stream: true }), buffer);
+    buffer = remainder;
+    for (const event of events) {
+      if (event.type === "response.output_item.done" && event.item) {
+        outputItems.set(event.output_index ?? outputItems.size, event.item);
+      }
+      if (
+        ["response.completed", "response.failed", "response.incomplete"].includes(event.type) &&
+        event.response
+      ) {
+        terminalResponse = event.response;
+      }
+    }
+  }
+  if (!terminalResponse) return jsonError(res, 502, "Codex backend returned no terminal response");
+  if (
+    (!Array.isArray(terminalResponse.output) || terminalResponse.output.length === 0) &&
+    outputItems.size > 0
+  ) {
+    terminalResponse.output = [...outputItems.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([, item]) => item);
+  }
+  return sendJson(res, 200, terminalResponse);
 }
 
 async function handleChatCompletions(req, res, ctx) {
@@ -318,9 +411,17 @@ export function createServer({
   apiKey,
   allowRemoteImages = false,
   maxBodyBytes = DEFAULT_MAX_BODY_BYTES,
+  tokenProvider = getAccessToken,
+  backendFetch = fetch,
 } = {}) {
   const authPath = resolveAuthPath(explicitAuthPath);
-  const ctx = { authPath, allowRemoteImages, maxBodyBytes };
+  const ctx = {
+    authPath,
+    allowRemoteImages,
+    maxBodyBytes,
+    tokenProvider,
+    backendFetch,
+  };
 
   return createHttpServer(async (req, res) => {
     try {
@@ -343,6 +444,9 @@ export function createServer({
       }
       if (req.method === "POST" && path === "/v1/chat/completions") {
         return await handleChatCompletions(req, res, ctx);
+      }
+      if (req.method === "POST" && path === "/v1/responses") {
+        return await handleResponses(req, res, ctx);
       }
       if (req.method === "GET" && path === "/v1/images/sizes") {
         return sendJson(res, 200, {

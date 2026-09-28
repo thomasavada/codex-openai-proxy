@@ -56,6 +56,15 @@ test("parseSSEEvents reassembles an event split across two chunks", () => {
   assert.deepEqual(second.events, [{ type: "b" }]);
 });
 
+test("parseSSEEvents accepts CRLF event boundaries", () => {
+  const { events, remainder } = parseSSEEvents(
+    'data: {"type":"response.completed","response":{"id":"x"}}\r\n\r\n',
+    "",
+  );
+  assert.deepEqual(events, [{ type: "response.completed", response: { id: "x" } }]);
+  assert.equal(remainder, "");
+});
+
 test("responsesEventToChatChunk maps a text delta", () => {
   const chunk = responsesEventToChatChunk(
     { type: "response.output_text.delta", delta: "Hi" },

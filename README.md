@@ -63,6 +63,7 @@ ran the Codex CLI).
 - `GET /agent.md` — agent guide (`text/markdown`; also `/llms.txt`, `/AGENTS.md`)
 - `GET /v1/models` — model slugs available to your account
 - `POST /v1/chat/completions` — OpenAI-compatible chat completions, streaming and non-streaming
+- `POST /v1/responses` — OpenAI Responses-compatible passthrough, streaming and non-streaming; preserves built-in tool events, structured web-search sources, and upstream usage
 - `GET /v1/images/sizes` — named frame presets (banner/ad/social) and supported formats
 - `POST /v1/images/generations` — image generation; PNG, JPEG or WebP as `b64_json`
 - `POST /v1/images/edits` — image generation guided by reference images (JSON base64 or multipart)

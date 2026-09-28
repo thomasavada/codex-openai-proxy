@@ -49,6 +49,185 @@ async function withServer(options, fn) {
 
 const AUTH = { Authorization: "Bearer test-key", "Content-Type": "application/json" };
 
+function sseResponse(events, status = 200) {
+  const body = `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`;
+  return new Response(body, {
+    status,
+    headers: { "Content-Type": "text/event-stream" },
+  });
+}
+
+test("POST /v1/responses preserves web-search evidence and real usage", async () => {
+  let upstream;
+  const output = [
+    {
+      id: "ws_test",
+      type: "web_search_call",
+      status: "completed",
+      action: {
+        sources: [{ url: "https://apps.shopify.com/loyaltylion", title: "LoyaltyLion" }],
+      },
+    },
+    {
+      id: "msg_test",
+      type: "message",
+      role: "assistant",
+      status: "completed",
+      content: [{ type: "output_text", text: "1. LoyaltyLion" }],
+    },
+  ];
+  const completed = {
+    id: "resp_test",
+    object: "response",
+    status: "completed",
+    model: "gpt-5.6-sol",
+    output: [],
+    usage: { input_tokens: 17, output_tokens: 9, total_tokens: 26 },
+  };
+
+  await withServer(
+    {
+      tokenProvider: async () => ({ accessToken: "codex-token", accountId: "account-1" }),
+      backendFetch: async (url, init) => {
+        upstream = { url, init, body: JSON.parse(init.body) };
+        return sseResponse([
+          { type: "response.created", response: { id: "resp_test" } },
+          ...output.map((item, output_index) => ({
+            type: "response.output_item.done",
+            output_index,
+            item,
+          })),
+          { type: "response.completed", response: completed },
+        ]);
+      },
+    },
+    async (call) => {
+      const request = {
+        model: "gpt-5.6-sol",
+        input: "Rank Shopify loyalty apps",
+        tools: [{ type: "web_search" }],
+        include: ["web_search_call.action.sources"],
+        stream: false,
+      };
+      const res = await call("/v1/responses", {
+        method: "POST",
+        headers: AUTH,
+        body: JSON.stringify(request),
+      });
+
+      assert.equal(res.status, 200);
+      assert.deepEqual(await res.json(), { ...completed, output });
+      assert.equal(upstream.url, "https://chatgpt.com/backend-api/codex/responses");
+      assert.equal(upstream.init.headers.Authorization, "Bearer codex-token");
+      assert.equal(upstream.init.headers["chatgpt-account-id"], "account-1");
+      assert.deepEqual(upstream.body.tools, request.tools);
+      assert.deepEqual(upstream.body.include, request.include);
+      assert.deepEqual(upstream.body.input, [
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: request.input }],
+        },
+      ]);
+      assert.equal(upstream.body.stream, true);
+      assert.equal(upstream.body.store, false);
+    },
+  );
+});
+
+test("POST /v1/responses streams upstream Responses events unchanged", async () => {
+  const events = [
+    { type: "response.output_text.delta", delta: "Loyalty" },
+    { type: "response.output_text.delta", delta: "Lion" },
+    { type: "response.completed", response: { id: "resp_stream", status: "completed" } },
+  ];
+  const expected = `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`;
+
+  await withServer(
+    {
+      tokenProvider: async () => ({ accessToken: "codex-token", accountId: "account-1" }),
+      backendFetch: async () => sseResponse(events),
+    },
+    async (call) => {
+      const res = await call("/v1/responses", {
+        method: "POST",
+        headers: AUTH,
+        body: JSON.stringify({ model: "gpt-5.6-sol", input: "Rank apps", stream: true }),
+      });
+      assert.equal(res.status, 200);
+      assert.match(res.headers.get("content-type"), /text\/event-stream/);
+      assert.equal(await res.text(), expected);
+    },
+  );
+});
+
+test("POST /v1/responses refreshes Codex OAuth once after an upstream 401", async () => {
+  const tokenCalls = [];
+  let backendCalls = 0;
+  await withServer(
+    {
+      tokenProvider: async (_path, options = {}) => {
+        tokenCalls.push(options);
+        return {
+          accessToken: options.forceRefresh ? "fresh-token" : "stale-token",
+          accountId: "account-1",
+        };
+      },
+      backendFetch: async (_url, init) => {
+        backendCalls += 1;
+        if (init.headers.Authorization === "Bearer stale-token") {
+          return new Response("expired", { status: 401 });
+        }
+        return sseResponse([
+          {
+            type: "response.completed",
+            response: { id: "resp_refreshed", object: "response", status: "completed", output: [] },
+          },
+        ]);
+      },
+    },
+    async (call) => {
+      const res = await call("/v1/responses", {
+        method: "POST",
+        headers: AUTH,
+        body: JSON.stringify({ model: "gpt-5.6-sol", input: "Hello" }),
+      });
+      assert.equal(res.status, 200);
+      assert.equal((await res.json()).id, "resp_refreshed");
+      assert.equal(backendCalls, 2);
+      assert.deepEqual(tokenCalls, [{}, { forceRefresh: true }]);
+    },
+  );
+});
+
+test("POST /v1/responses returns native failed and incomplete terminal responses", async () => {
+  for (const status of ["failed", "incomplete"]) {
+    const terminal = {
+      id: `resp_${status}`,
+      object: "response",
+      status,
+      output: [],
+      ...(status === "failed" ? { error: { message: "upstream failed" } } : {}),
+    };
+    await withServer(
+      {
+        tokenProvider: async () => ({ accessToken: "codex-token", accountId: "account-1" }),
+        backendFetch: async () =>
+          sseResponse([{ type: `response.${status}`, response: terminal }]),
+      },
+      async (call) => {
+        const res = await call("/v1/responses", {
+          method: "POST",
+          headers: AUTH,
+          body: JSON.stringify({ model: "gpt-5.6-sol", input: "Hello" }),
+        });
+        assert.equal(res.status, 200);
+        assert.deepEqual(await res.json(), terminal);
+      },
+    );
+  }
+});
+
 test("GET /v1/images/sizes lists the banner presets and capabilities", async () => {
   await withServer({}, async (call) => {
     const res = await call("/v1/images/sizes", { headers: AUTH });
